@@ -1,49 +1,11 @@
-/**
- * 短信转发系统 —— Cloudflare Worker 单文件实现
- *
- * 职责只有三件事：
- *   1. 自身鉴权（ADMIN 密码）
- *   2. KV 读写（绑定名 kv，超限清理最旧，每条带时间戳）
- *   3. 极简网页（刷新 + 短信列表）
- *
- * 路由布局 —— **所有接口都挂在 /api/ 下面**，根路径只留网页：
- *
- *   GET  /             网页（无数据，不校验密码）
- *   GET  /api/health   健康检查（无数据，不校验密码）
- *   POST /api/sms      写入短信
- *   GET  /api/sms      读取列表
- *
- * 接口统一挂 /api/ 是为了让 WAF 里一条 `URI Path starts with /api/` 的 Skip 规则
- * 就能覆盖全部接口 —— 托管挑战需要执行 JS，安卓 App 天然过不去，必须整体跳过。
- *
- * 访问控制分两层，各管一段，互不依赖：
- *
- *   ① 边缘 WAF 规则 —— 只放行携带约定字段（形如 `access_<32位>`）的请求。
- *      挡的是扫描器和刷量，保护 Workers 免费额度。请求头或查询参数带都算数。
- *      本文件不参与校验（被拦的请求根本到不了这里）。
- *   ② Worker 自身 —— 校验 ADMIN 密码，请求头 X-Admin-Password / AccessToken /
- *      `Authorization: Bearer` 三选一。这是最后一道闸：即使 WAF 规则被绕过，
- *      没有密码也读不到、写不进任何数据。
- *
- * KV 数据布局：
- *   sms:index            -> JSON 数组，按时间升序保存记录 id（最旧在前）
- *   sms:rec:<id>         -> JSON 单条记录
- *   sms:cid:<clientId>   -> 记录 id，用于幂等去重（带 TTL）
- *
- * id 形如 `000001758200000000-3f9a2c`：前 18 位是补零的毫秒时间戳，
- * 因此 key 的字典序 == 时间序。
- */
-
-// ---------------------------------------------------------------- 配置
-
-const MAX_BATCH = 500; // 单次请求最多接收多少条
-const DEFAULT_MAX_RECORDS = 200; // 未配置 MAX_RECORDS 时的默认上限
-const LIST_PAGE = 1000; // KV list 分页大小
+const MAX_BATCH = 500;
+const DEFAULT_MAX_RECORDS = 200;
+const LIST_PAGE = 1000;
 
 const INDEX_KEY = "sms:index";
 const REC_PREFIX = "sms:rec:";
 const CID_PREFIX = "sms:cid:";
-const DEDUP_TTL = 60 * 60 * 24 * 7; // 幂等键保留 7 天
+const DEDUP_TTL = 60 * 60 * 24 * 7;
 
 const ICON_URL = "https://hzgbai.dpdns.org/icon/mainicon.png";
 
@@ -54,9 +16,6 @@ const CORS_HEADERS = {
   "Access-Control-Max-Age": "86400",
 };
 
-// ---------------------------------------------------------------- 鉴权
-
-/** 定长比较，避免早退泄露长度/前缀信息。 */
 function safeEqual(a, b) {
   const x = new TextEncoder().encode(String(a ?? ""));
   const y = new TextEncoder().encode(String(b ?? ""));
@@ -66,12 +25,6 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-/**
- * 从请求里取 ADMIN 密码，三种写法任选其一：
- *   X-Admin-Password: <密码>     —— 安卓客户端与网页用
- *   AccessToken: <密码>          —— 兼容只认这个名字的调用方
- *   Authorization: Bearer <密码> —— 标准写法，curl / 脚本方便
- */
 function extractAdminCredential(request) {
   const header = request.headers.get("X-Admin-Password");
   if (header) return header;
@@ -85,7 +38,6 @@ function extractAdminCredential(request) {
   return "";
 }
 
-/** 返回 { ok, status, reason }。 */
 function checkAdmin(request, env) {
   const expected = env.ADMIN;
   if (!expected) {
@@ -100,8 +52,6 @@ function checkAdmin(request, env) {
   }
   return { ok: true };
 }
-
-// ---------------------------------------------------------------- KV 存储
 
 function pad(n, len) {
   return String(n).padStart(len, "0");
@@ -135,10 +85,6 @@ class SmsStore {
     return raw.filter((id) => typeof id === "string" && id.length > 0);
   }
 
-  /**
-   * 追加一条记录。返回 { record, duplicate, evicted }。
-   * clientId 命中去重表时直接返回已存在的记录，不重复写入。
-   */
   async append(input) {
     const ts = Number.isFinite(input.ts) ? input.ts : Date.now();
     const clientId = typeof input.clientId === "string" ? input.clientId.trim() : "";
@@ -173,13 +119,6 @@ class SmsStore {
     return { record, duplicate: false, evicted };
   }
 
-  /**
-   * 把 id 写进索引；超出 max 时从头部（最旧）裁掉并删除对应记录。
-   *
-   * KV 没有原子操作，高并发下 read-modify-write 可能互相覆盖。
-   * 这里的做法是写完后回读校验，最多重试 5 次；短信转发这种量级足够。
-   * 真正丢索引也能靠 rebuildIndex() 从 sms:rec: 前缀自愈。
-   */
   async #indexAppend(id) {
     let evicted = [];
 
@@ -207,7 +146,6 @@ class SmsStore {
     return evicted;
   }
 
-  /** 读取记录，新的在前。顺手跳过索引里已被删除的悬空 id。 */
   async list({ limit = 100, since = 0 } = {}) {
     let index = await this.readIndex();
     if (index.length === 0) index = await this.rebuildIndex();
@@ -224,7 +162,6 @@ class SmsStore {
     return picked;
   }
 
-  /** 索引丢失/损坏时，从 sms:rec: 前缀重建。 */
   async rebuildIndex() {
     const ids = [];
     let cursor;
@@ -240,8 +177,6 @@ class SmsStore {
     return trimmed;
   }
 }
-
-// ---------------------------------------------------------------- 网页
 
 const PAGE_HTML = `<!doctype html>
 <html lang="zh-CN">
@@ -412,8 +347,6 @@ const PAGE_HTML = `<!doctype html>
 </html>
 `;
 
-// ---------------------------------------------------------------- 路由
-
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -430,7 +363,6 @@ function getStore(env) {
   return new SmsStore(env.kv, normalizeMax(env.MAX_RECORDS));
 }
 
-/** 兼容客户端可能用的多种字段名。 */
 function normalizeOne(raw) {
   if (!raw || typeof raw !== "object") return null;
   const from = String(raw.from ?? raw.address ?? raw.sender ?? "").trim();
@@ -448,7 +380,6 @@ function normalizeOne(raw) {
   };
 }
 
-/** POST /api/sms —— 接收短信，单条或批量 */
 async function handleIngest(request, env) {
   let body;
   try {
@@ -501,7 +432,6 @@ async function handleIngest(request, env) {
   return json(payload, failed === 0 ? 200 : failed === results.length ? 400 : 207);
 }
 
-/** GET /api/sms —— 列出短信，新的在前 */
 async function handleList(url, env) {
   const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 100;
@@ -522,22 +452,15 @@ export default {
     }
 
     try {
-      // ── 网页本体（不是接口，保留在根路径）────────────────────────────
-      // 页面里没有任何数据，所以不校验 ADMIN 密码。
       if (path === "/" || path === "/index.html") {
         if (request.method !== "GET") return text("Method Not Allowed", 405);
         return text(PAGE_HTML, 200, "text/html; charset=utf-8");
       }
 
-      // ── 所有接口一律挂在 /api/ 下面 ───────────────────────────────────
-      // 这样 WAF 里只需要写一条 `URI Path starts with /api/` 的 Skip 规则，
-      // 就能让全部接口跳过托管挑战（挑战要执行 JS，安卓 App 过不去）。
       if (!path.startsWith("/api/")) {
         return json({ ok: false, error: `未知路由 ${request.method} ${path}` }, 404);
       }
 
-      // GET /api/health —— 健康检查，给客户端「测试连接」用。
-      // 不返回任何数据，所以不校验密码。
       if (path === "/api/health") {
         if (request.method !== "GET") return json({ ok: false, error: "Method Not Allowed" }, 405);
         return json({
@@ -548,7 +471,6 @@ export default {
         });
       }
 
-      // ── 以下全部需要 ADMIN 密码 ──────────────────────────────────────
       const auth = checkAdmin(request, env);
       if (!auth.ok) {
         return json({ ok: false, error: auth.reason }, auth.status);
