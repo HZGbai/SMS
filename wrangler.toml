@@ -1,0 +1,43 @@
+name = "sms-forwarder"
+main = "workers.js"
+compatibility_date = "2026-09-01"
+
+# workers_dev 打开会多出一条 *.workers.dev 路由，而 WAF 规则只作用于下面那个
+# 自定义域名（sms.hzgbai.dpdns.org）。留着它等于给刷量开了个后门 ——
+# 别人直接打 workers.dev 地址就绕过了全部 WAF 规则。
+# 所以这里关掉：Worker 只从自定义域名进。
+# 本地调试不受影响（wrangler dev 走 localhost，跟这个开关无关）。
+workers_dev = false
+
+# 自定义域名路由。custom_domain = true 会让 `wrangler deploy` 自动创建
+# sms.hzgbai.dpdns.org 的 DNS 记录并绑定到这个 Worker（不需要手工建记录）。
+#
+# 如果你更习惯在控制台绑：Workers → sms-forwarder → Settings → Domains & Routes
+# → Add → Custom Domain，那就把下面三行注释掉，否则 deploy 会报域名冲突。
+[[routes]]
+pattern = "sms.hzgbai.dpdns.org"
+custom_domain = true
+
+# ⚠️ 部署前必改：下面两个 id 是占位符，全 0 的绑定是无效的。
+#    先跑 `npx wrangler kv namespace create kv`，把返回的 id 填进 `id`。
+#    `preview_id` 可以留空或填同一个（只有 wrangler dev --remote 才用得上）。
+#    本地 `wrangler dev` 用 Miniflare 模拟 KV，不读这里的 id，所以本地能跑不代表线上能跑。
+[[kv_namespaces]]
+binding = "kv"
+id = "00000000000000000000000000000000"
+preview_id = "00000000000000000000000000000000"
+
+[vars]
+# 非敏感配置放这里；ADMIN 请用 `wrangler secret put ADMIN` 存为 Secret。
+MAX_RECORDS = "200"
+
+# 访问控制分两层：
+#   ① 边缘 WAF 规则 —— 请求的查询串里必须出现 access_<32位>，否则直接 Block，
+#      请求到不了 Worker。规则在 Cloudflare 控制台配，不在这个文件里。
+#      另外 /api/* 还需要一条 Skip 规则跳过托管挑战（挑战要执行 JS，App 过不去）。
+#   ② Worker 自身 —— 校验 ADMIN 密码（X-Admin-Password / AccessToken / Bearer 任一）。
+#      Worker 代码里没有任何 JWT / Access 校验逻辑。
+
+# 开发日志
+[observability]
+enabled = true
